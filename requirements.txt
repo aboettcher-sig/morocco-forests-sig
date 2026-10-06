@@ -1,0 +1,10 @@
+geopandas>=0.14.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+polars>=1.0.0
+earthengine-api>=0.1.400
+google-auth>=2.0.0
+geoalchemy2>=0.14.0
+python-dotenv>=1.0.0
+google-api-python-client
+google-auth-oauthlib
