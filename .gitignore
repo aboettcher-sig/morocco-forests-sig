@@ -19,3 +19,9 @@ token.json
 Planet/
 goog/
 data/
+GEE_Morocco_Forests/
+*.csv
+*.gpkg
+pull_gee_data_chunked.ipynb
+scripts/utility/pull_gee_data_chunked.ipynb
+
