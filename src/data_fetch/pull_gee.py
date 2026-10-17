@@ -2,11 +2,14 @@ import os
 import sys
 import time
 import argparse
+import re
 from pathlib import Path
 from multiprocessing.pool import ThreadPool
 from functools import partial
+import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import box
 import requests
 import ee
 
@@ -21,11 +24,25 @@ from drive_utils import upload_file_to_drive
 
 _COLLECTION_PIXEL_SIZE_CACHE = {}
 
+KNOWN_SCALES = {
+    "COPERNICUS/S2_SR_HARMONIZED": (10.0, 60.0),
+    "COPERNICUS/S1_GRD": (10.0, 10.0),
+    "LANDSAT/LC09/C02/T1_L2": (30.0, 30.0),
+    "LANDSAT/LC08/C02/T1_L2": (30.0, 30.0),
+    "LANDSAT/LE07/C02/T1_L2": (30.0, 30.0),
+    "LANDSAT/LT05/C02/T1_L2": (30.0, 30.0),
+    "IDAHO_EPSCOR/TERRACLIMATE": (4000.0, 4000.0),
+    "NOAA/CFSV2/FOR6H_HARMONIZED": (30000.0, 30000.0),
+    "GOOGLE/DYNAMICWORLD/V1": (10.0, 10.0),
+    "CSP/ERGo/1_0/Global/SRTM_mTPI": (90.0, 270.0),
+    "MERIT/DEM/v1_0_3": (90.0, 90.0),
+}
+
 DATASET_REGISTRY = {
-    # Dense datasets processed via direct chunking and streamed directly into PostGIS
+    # Dense datasets
     "Sentinel2":    {"id": "COPERNICUS/S2_SR_HARMONIZED", "chunked": True},
     "Sentinel1":    {"id": "COPERNICUS/S1_GRD",            "chunked": True},
-    # Datasets processed via GEE Drive export tasks
+    # Coarse / standard datasets processed via GEE Drive export tasks
     "Landsat9":     {"id": "LANDSAT/LC09/C02/T1_L2",       "chunked": False},
     "Landsat8":     {"id": "LANDSAT/LC08/C02/T1_L2",       "chunked": False},
     "Landsat7":     {"id": "LANDSAT/LE07/C02/T1_L2",       "chunked": False},
@@ -69,8 +86,11 @@ def fetch_aoi_from_db(aoi_name: str) -> gpd.GeoDataFrame:
 def get_collection_pixel_sizes(dataset_id: str):
     """
     Returns the minimum and maximum native band pixel sizes (in meters) for a dataset.
-    Filters out unprojected coordinate/metadata bands (>1000m) to avoid bloated buffers.
+    Uses pre-cached known scales to avoid blocking network round-trips.
     """
+    if dataset_id in KNOWN_SCALES:
+        return KNOWN_SCALES[dataset_id]
+
     if dataset_id not in _COLLECTION_PIXEL_SIZE_CACHE:
         asset_type = ee.data.getAsset(dataset_id)["type"]
         if asset_type == "IMAGE_COLLECTION":
@@ -93,22 +113,58 @@ def get_collection_pixel_sizes(dataset_id: str):
         ]
         valid_scales = [s for s in band_scales if s <= 1000] or band_scales
         _COLLECTION_PIXEL_SIZE_CACHE[dataset_id] = (min(valid_scales), max(valid_scales))
-        print(f"{dataset_id}: native band scales {min(valid_scales):g}-{max(valid_scales):g} m")
 
     return _COLLECTION_PIXEL_SIZE_CACHE[dataset_id]
 
 
 def build_aoi(gdf: gpd.GeoDataFrame, dataset_id: str = None, pixel_size: float = None):
-    """Buffer gdf by 3x native pixel size, reproject to WGS84, and return an ee.FeatureCollection."""
+    """Reproject to WGS84, buffer small AOIs (<25 km²) by 3x native pixel size, and return ee.FeatureCollection."""
     if pixel_size is None:
         if dataset_id is None:
             raise ValueError("Pass either dataset_id or pixel_size.")
         _, pixel_size = get_collection_pixel_sizes(dataset_id)
 
-    buffered = gdf.copy()
     utm_crs = gdf.estimate_utm_crs()
-    buffered['geometry'] = buffered.to_crs(utm_crs).buffer(pixel_size * 3).to_crs('EPSG:4326')
+    area_km2 = gdf.to_crs(utm_crs).geometry.area.sum() / 1e6
+    buffered = gdf.copy()
+    if area_km2 < 25.0:
+        buffered['geometry'] = buffered.to_crs(utm_crs).buffer(pixel_size * 3).to_crs('EPSG:4326')
+    else:
+        buffered['geometry'] = buffered['geometry'].to_crs('EPSG:4326')
     return ee.FeatureCollection([ee.Feature(ee.Geometry(g.__geo_interface__)) for g in buffered['geometry']])
+
+
+def get_spatial_tiles(gdf: gpd.GeoDataFrame, tile_deg: float = 0.04):
+    """
+    Subdivides large regional AOIs into smaller spatial tiles to avoid GEE memory limits.
+    Returns list of (tile_gdf, tile_suffix).
+    For small AOIs (< 25 km²), returns [(gdf, "")].
+    """
+    utm_crs = gdf.estimate_utm_crs()
+    area_km2 = gdf.to_crs(utm_crs).geometry.area.sum() / 1e6
+    if area_km2 < 25.0:
+        return [(gdf, "")]
+
+    minx, miny, maxx, maxy = gdf.total_bounds
+    geom = gdf.geometry.union_all() if hasattr(gdf.geometry, 'union_all') else gdf.geometry.unary_union
+    x_coords = np.arange(minx, maxx + tile_deg, tile_deg)
+    y_coords = np.arange(miny, maxy + tile_deg, tile_deg)
+
+    tiles = []
+    tile_idx = 0
+    for x in x_coords[:-1]:
+        for y in y_coords[:-1]:
+            cell = box(x, y, min(x + tile_deg, maxx), min(y + tile_deg, maxy))
+            if geom.intersects(cell):
+                inter = geom.intersection(cell)
+                if not inter.is_empty:
+                    tile_gdf = gpd.GeoDataFrame(
+                        [{'name': gdf['name'].iloc[0], 'geometry': inter}],
+                        crs="EPSG:4326"
+                    )
+                    tiles.append((tile_gdf, f"_tile_{tile_idx:02d}"))
+                    tile_idx += 1
+    return tiles
 
 
 def request_single_export(chunk_info, folder: str, filename_prefix: str):
@@ -171,12 +227,54 @@ def assemble_chunked_exports(folder: str, filename_prefix: str, engine=None, upl
     return final_path
 
 
+def assemble_tiles_to_csv(folder: str, aoi_name: str, engine=None):
+    """
+    Scans export folder for tile CSVs (e.g. Sentinel2_north_aoi_tile_00_2023_01.csv)
+    and combines them into unified master CSVs (e.g. Sentinel2_north_aoi_2023_01.csv).
+    """
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        return
+
+    pattern = re.compile(rf"^([A-Za-z0-9]+)_{re.escape(aoi_name)}_tile_\d+_(.+)\.csv$")
+    groups = {}
+    for f in folder_path.glob("*.csv"):
+        m = pattern.match(f.name)
+        if m:
+            dataset, suffix = m.group(1), m.group(2)
+            key = f"{dataset}_{aoi_name}_{suffix}"
+            groups.setdefault(key, []).append(f)
+
+    for master_name, tile_files in groups.items():
+        master_file = folder_path / f"{master_name}.csv"
+        if master_file.exists():
+            continue
+        print(f"\nAssembling {len(tile_files)} tile CSVs into {master_file.name}...")
+        dfs = []
+        for tf in sorted(tile_files):
+            try:
+                tdf = pd.read_csv(tf)
+                m = re.search(r"_tile_(\d+)_", tf.name)
+                if m and "tile_id" not in tdf.columns:
+                    tdf["tile_id"] = int(m.group(1))
+                dfs.append(tdf)
+            except Exception as e:
+                print(f"  Note reading {tf.name}: {e}")
+        if dfs:
+            merged = pd.concat(dfs, ignore_index=True)
+            merged.columns = [str(c).replace(':', '_').replace('.', '_') for c in merged.columns]
+            merged.to_csv(master_file, index=False)
+            print(f"  [OK] Assembled {master_file.name} ({len(merged)} total rows)")
+            if engine is not None:
+                ingest_df_to_db(merged, master_file.name, engine)
+
+
 def export_gee_dataset_chunked(dataset_id: str, aoi, start_date: str, end_date: str,
                                filename_prefix: str, folder: str = 'GEE_Exports',
                                n_helpers: int = 6, n_pixels_per_chunk: int = 3000,
                                engine=None, upload_to_drive: bool = True):
     """
-    Downloads dense datasets (Sentinel-1, Sentinel-2) inside an AOI in parallel chunks.
+    Downloads dense datasets (Sentinel-1, Sentinel-2) inside small AOIs via parallel HTTP chunks.
     Bypasses GEE's 10MB text serialization constraint and streams directly into PostGIS.
     """
     os.makedirs(folder, exist_ok=True)
@@ -213,7 +311,7 @@ def export_gee_dataset_chunked(dataset_id: str, aoi, start_date: str, end_date: 
 
         min_pixel_size, _ = get_collection_pixel_sizes(dataset_id)
         sampled_fc = collection.map(
-            lambda img: img.sample(region=aoi.geometry(), scale=min_pixel_size, geometries=True, dropNulls=False)
+            lambda img: img.sample(region=aoi.geometry(), scale=min_pixel_size, geometries=True, dropNulls=False, tileScale=16)
         ).flatten()
         fc_size = sampled_fc.size().getInfo()
 
@@ -255,18 +353,28 @@ def export_gee_dataset(dataset_id: str, aoi, start_date: str, end_date: str,
 
         min_pixel_size, _ = get_collection_pixel_sizes(dataset_id)
         sampled_fc = collection.map(
-            lambda img: img.sample(region=aoi.geometry(), scale=min_pixel_size, geometries=True, dropNulls=False)
+            lambda img: img.sample(region=aoi.geometry(), scale=min_pixel_size, geometries=True, dropNulls=False, tileScale=16)
         ).flatten()
 
-        ee.batch.Export.table.toDrive(
+        task = ee.batch.Export.table.toDrive(
             collection=sampled_fc,
             description=filename_prefix,
             folder=folder,
             fileNamePrefix=filename_prefix,
             fileFormat="CSV"
-        ).start()
-        print(f"Started export task: {filename_prefix} (CSV)")
-
+        )
+        for attempt in range(10):
+            try:
+                task.start()
+                print(f"Started export task: {filename_prefix} (CSV)")
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                if "limit of active tasks" in err_str or "too many tasks" in err_str:
+                    print(f"  [Queue Throttled] GEE task queue limit reached. Waiting 60s for tasks to complete...")
+                    time.sleep(60)
+                else:
+                    raise
     except Exception as e:
         print(f"Failed to process dataset {dataset_id}: {e}")
 
@@ -298,7 +406,7 @@ def export_terrain_data(gdf: gpd.GeoDataFrame, aoi_name: str, drive_folder: str)
         aoi_ee_terrain = build_aoi(gdf, "CSP/ERGo/1_0/Global/SRTM_mTPI")
         img = ee.Image("CSP/ERGo/1_0/Global/SRTM_mTPI")
         min_p, _ = get_collection_pixel_sizes("CSP/ERGo/1_0/Global/SRTM_mTPI")
-        sampled = img.sample(region=aoi_ee_terrain.geometry(), scale=min_p, geometries=True, dropNulls=False)
+        sampled = img.sample(region=aoi_ee_terrain.geometry(), scale=min_p, geometries=True, dropNulls=False, tileScale=16)
         ee.batch.Export.table.toDrive(
             collection=sampled, description=f"SRTM_mTPI_{aoi_name}", folder=drive_folder,
             fileNamePrefix=f"SRTM_mTPI_{aoi_name}", fileFormat="CSV"
@@ -316,7 +424,7 @@ def export_terrain_data(gdf: gpd.GeoDataFrame, aoi_name: str, drive_folder: str)
         }
         for key, layer_img in layers.items():
             export_filename = f"Terrain_{aoi_name}_{key}"
-            sampled = layer_img.rename(key).sample(region=aoi_ee_90.geometry(), scale=90, geometries=True, dropNulls=False)
+            sampled = layer_img.rename(key).sample(region=aoi_ee_90.geometry(), scale=90, geometries=True, dropNulls=False, tileScale=16)
             ee.batch.Export.table.toDrive(
                 collection=sampled, description=export_filename, folder=drive_folder,
                 fileNamePrefix=export_filename, fileFormat="CSV"
@@ -328,10 +436,26 @@ def export_terrain_data(gdf: gpd.GeoDataFrame, aoi_name: str, drive_folder: str)
 
 def main(aoi_name: str, drive_folder: str, start_year: int, end_year: int,
          s2_interval: str = "monthly", project: str = "morocco-data-509823",
-         upload_to_drive: bool = True, datasets=None, months=None):
+         upload_to_drive: bool = True, datasets=None, months=None,
+         tile_size: float = 0.04, max_tiles: int = None):
     authenticate_and_initialize(project=project)
     engine = get_db_engine()
     gdf = fetch_aoi_from_db(aoi_name)
+
+    utm_crs = gdf.estimate_utm_crs()
+    area_km2 = gdf.to_crs(utm_crs).geometry.area.sum() / 1e6
+    is_regional = area_km2 >= 25.0
+
+    if is_regional:
+        tiles = get_spatial_tiles(gdf, tile_deg=tile_size)
+        total_tiles = len(tiles)
+        if max_tiles is not None and max_tiles > 0:
+            print(f"Regional AOI ({area_km2:.1f} km²): running first {max_tiles} of {total_tiles} spatial tiles (--max-tiles {max_tiles})...")
+            tiles = tiles[:max_tiles]
+        else:
+            print(f"Regional AOI ({area_km2:.1f} km²): subdivided into {total_tiles} spatial tiles...")
+    else:
+        tiles = [(gdf, "")]
 
     # 1. Process Time-Series Datasets
     active_datasets = DATASET_REGISTRY
@@ -343,32 +467,41 @@ def main(aoi_name: str, drive_folder: str, start_year: int, end_year: int,
         print(f"\n--- Submitting Time Series Datasets ({start_year} to {end_year}) ---")
         for name, info in active_datasets.items():
             dataset_id = info["id"]
-            is_chunked = info["chunked"]
+            is_dense = any(ident in dataset_id.upper() for ident in ("S2", "S1", "COPERNICUS", "DYNAMICWORLD"))
+            use_chunked = info["chunked"] and not is_regional
+
             try:
-                aoi_ee = build_aoi(gdf, dataset_id)
-                for year in range(start_year, end_year + 1):
-                    intervals = get_date_intervals(dataset_id, year, s2_interval=s2_interval, months=months)
-                    for start_date, end_date, suffix in intervals:
-                        filename = f"{name}_{aoi_name}_{suffix}"
-                        if is_chunked:
-                            export_gee_dataset_chunked(
-                                dataset_id=dataset_id, aoi=aoi_ee, start_date=start_date, end_date=end_date,
-                                filename_prefix=filename, folder=drive_folder, engine=engine, upload_to_drive=upload_to_drive
-                            )
-                        else:
-                            export_gee_dataset(
-                                dataset_id=dataset_id, aoi=aoi_ee, start_date=start_date, end_date=end_date,
-                                filename_prefix=filename, folder=drive_folder
-                            )
+                # Dense datasets on regional AOIs iterate over spatial tiles
+                process_tiles = tiles if (is_regional and is_dense) else [(gdf, "")]
+
+                for tile_gdf, tile_suffix in process_tiles:
+                    aoi_ee = build_aoi(tile_gdf, dataset_id)
+                    for year in range(start_year, end_year + 1):
+                        intervals = get_date_intervals(dataset_id, year, s2_interval=s2_interval, months=months)
+                        for start_date, end_date, suffix in intervals:
+                            filename = f"{name}_{aoi_name}{tile_suffix}_{suffix}"
+                            if use_chunked:
+                                export_gee_dataset_chunked(
+                                    dataset_id=dataset_id, aoi=aoi_ee, start_date=start_date, end_date=end_date,
+                                    filename_prefix=filename, folder=drive_folder, engine=engine, upload_to_drive=upload_to_drive
+                                )
+                            else:
+                                export_gee_dataset(
+                                    dataset_id=dataset_id, aoi=aoi_ee, start_date=start_date, end_date=end_date,
+                                    filename_prefix=filename, folder=drive_folder
+                                )
             except Exception as e:
                 print(f"Failed to process {name}: {e}")
 
-    # 2. Process Static Terrain Data
+    # 2. Process Static Terrain Data (coarse scale, submitted for whole AOI)
     run_terrain = datasets is None or any(d.lower() in ("terrain", "srtm", "merit") for d in datasets)
     if run_terrain:
         export_terrain_data(gdf, aoi_name, drive_folder)
 
-    # 3. Ingest any local CSVs from folder into PostGIS
+    # 3. Assemble any tile CSVs in export folder
+    assemble_tiles_to_csv(drive_folder, aoi_name, engine=engine)
+
+    # 4. Ingest any local CSVs from folder into PostGIS
     if Path(drive_folder).exists():
         print(f"\n--- Syncing local CSVs from '{drive_folder}' into PostgreSQL ---")
         try:
@@ -381,7 +514,7 @@ def main(aoi_name: str, drive_folder: str, start_year: int, end_year: int,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch and export GEE data to Google Drive and PostGIS.")
-    parser.add_argument("--aoi", type=str, required=True, help="Name of the AOI in PostGIS (e.g., test_site_one)")
+    parser.add_argument("--aoi", type=str, required=True, help="Name of the AOI in PostGIS (e.g., test_site_one, north_aoi)")
     parser.add_argument("--folder", type=str, default="GEE_Morocco_Forests", help="Drive folder / local export folder")
     parser.add_argument("--start-year", type=int, default=2019, help="Start year for time series data")
     parser.add_argument("--end-year", type=int, default=2023, help="End year for time series data")
@@ -390,6 +523,8 @@ if __name__ == "__main__":
     parser.add_argument("--s2-interval", type=str, default="monthly", choices=["monthly", "quarterly", "yearly"],
                         help="Date slicing interval for 10m datasets (default: monthly)")
     parser.add_argument("--months", nargs="+", type=int, default=None, help="Specific months (1-12) to pull. Default: all")
+    parser.add_argument("--tile-size", type=float, default=0.04, help="Spatial tile size in degrees for regional AOIs (default: 0.04)")
+    parser.add_argument("--max-tiles", type=int, default=None, help="Maximum number of spatial tiles to process (default: all)")
     parser.add_argument("--upload-drive", action="store_true", default=True, help="Upload CSVs to Google Drive (default: True)")
     parser.add_argument("--no-upload-drive", dest="upload_drive", action="store_false", help="Disable Drive upload")
 
@@ -403,5 +538,7 @@ if __name__ == "__main__":
         project=args.project,
         upload_to_drive=args.upload_drive,
         datasets=args.datasets,
-        months=args.months
+        months=args.months,
+        tile_size=args.tile_size,
+        max_tiles=args.max_tiles
     )

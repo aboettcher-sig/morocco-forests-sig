@@ -29,6 +29,9 @@ def load_aoi_to_postgis(gpkg_path: str, table_name: str = "aoi_boundaries"):
     if 'name' not in gdf.columns:
         gdf['name'] = os.path.basename(gpkg_path).replace('.gpkg', '')
 
+    # Standardize columns to ['name', 'geometry'] for seamless database compatibility
+    gdf = gdf[['name', 'geometry']]
+
     # Get unique names in the current GeoDataFrame to manage duplicates
     aoi_names = gdf['name'].unique()
 
@@ -43,6 +46,10 @@ def load_aoi_to_postgis(gpkg_path: str, table_name: str = "aoi_boundaries"):
         # Prevent duplicate names by deleting old records with the same name before appending
         # Using engine.begin() automatically commits the transaction
         with engine.begin() as conn:
+            try:
+                conn.execute(text(f'ALTER TABLE "{table_name}" ALTER COLUMN geometry TYPE geometry(Geometry, 4326);'))
+            except Exception:
+                pass
             for name in aoi_names:
                 print(f"Cleaning up old entries for AOI: '{name}' (if they exist)...")
                 del_query = text(f"DELETE FROM {table_name} WHERE name = :name")

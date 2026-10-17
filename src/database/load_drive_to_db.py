@@ -16,12 +16,11 @@ from drive_utils import get_drive_service
 from sqlalchemy import text
 
 
-def find_folder_id(service, folder_name: str):
-    """Searches Drive for a folder by name and returns its ID."""
+def find_all_folder_ids(service, folder_name: str):
+    """Searches Drive for all folders with the given name and returns a set of their IDs."""
     query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    items = results.get('files', [])
-    return items[0]['id'] if items else None
+    results = service.files().list(q=query, fields="files(id, name)", pageSize=1000).execute()
+    return [f['id'] for f in results.get('files', [])]
 
 
 def download_and_load(folder_name: str):
@@ -31,18 +30,25 @@ def download_and_load(folder_name: str):
         print(" Error: Google Drive credentials not found or unauthenticated.")
         return
 
-    folder_id = find_folder_id(service, folder_name)
-    if not folder_id:
-        print(f" Error: Could not find folder '{folder_name}' in Google Drive.")
+    folder_ids = find_all_folder_ids(service, folder_name)
+    if not folder_ids:
+        print(f" Error: Could not find any folder named '{folder_name}' in Google Drive.")
         return
 
-    # Get all CSV files inside the folder
-    query = f"'{folder_id}' in parents and mimeType='text/csv' and trashed=false"
-    results = service.files().list(q=query, fields="files(id, name, size)", pageSize=1000).execute()
-    files = results.get('files', [])
+    print(f" Found {len(folder_ids)} folder instance(s) named '{folder_name}'. Collecting CSV files...")
+    
+    # Query all CSV files in Drive that belong to any of these folders
+    files = []
+    # Batch query in groups of 20 parents to prevent query length overflow
+    for i in range(0, len(folder_ids), 20):
+        parent_group = folder_ids[i:i+20]
+        parents_clause = " or ".join([f"'{fid}' in parents" for fid in parent_group])
+        query = f"({parents_clause}) and mimeType='text/csv' and trashed=false"
+        results = service.files().list(q=query, fields="files(id, name, size)", pageSize=1000).execute()
+        files.extend(results.get('files', []))
 
     if not files:
-        print(f" No CSV files found in folder '{folder_name}'.")
+        print(f" No CSV files found in '{folder_name}' folders.")
         return
 
     print(f" Found {len(files)} CSV files in Google Drive. Streaming directly into PostGIS...")
