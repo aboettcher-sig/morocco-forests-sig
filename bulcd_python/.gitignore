@@ -1,0 +1,4 @@
+# Local data, never committed
+cache/
+outputs/
+.env
